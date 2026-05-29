@@ -1,6 +1,6 @@
 import unittest
 
-from market_predictor.ml.preprocessing import normalize_window
+from model_core.preprocessing import normalize_window
 
 
 class PreprocessingTest(unittest.TestCase):

@@ -3,9 +3,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from model_core.input_schema import MODEL_INPUT_SIZE
+
 
 class MarketPredictor(nn.Module):
-    def __init__(self, input_size: int = 4) -> None:
+    def __init__(self, input_size: int = MODEL_INPUT_SIZE) -> None:
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_size, 16),
@@ -17,7 +19,7 @@ class MarketPredictor(nn.Module):
         return self.network(features)
 
 
-def create_model(input_size: int = 4) -> MarketPredictor:
+def create_model(input_size: int = MODEL_INPUT_SIZE) -> MarketPredictor:
     model = MarketPredictor(input_size=input_size)
     model.eval()
     return model

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import torch
 
-from market_predictor.ml.model import create_model
-from market_predictor.ml.preprocessing import normalize_window
+from model_core.input_schema import ensure_window_size
+from model_core.model import create_model
+from model_core.preprocessing import normalize_window
 
 
 class InferenceService:
@@ -11,6 +12,7 @@ class InferenceService:
         self._model = create_model()
 
     def predict(self, values: list[float]) -> float:
+        ensure_window_size(values)
         normalized = normalize_window(values)
         features = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():

@@ -9,12 +9,12 @@ Stack implementada neste repositório:
 - Monorepo gerenciado por Poetry
 
 ### Estrutura
-- `src/market_predictor/api`: API (somente inferência)
-- `src/market_predictor/worker`: pipeline de treinamento separado
-- `src/market_predictor/ml`: modelo e pré-processamento modularizado
-- `src/market_predictor/db`: acesso de leitura para séries temporais
+- `apps/api`: API (somente inferência)
+- `apps/data_worker`: worker que baixa dados em loop
+- `packages/model_core`: modelo e pré-processamento modularizado
+- `packages/database`: acesso a dados/TimescaleDB
 
 ### Regras de arquitetura aplicadas
 1. Não há notebooks em produção; código de ML está em módulos Python.
-2. A API não treina modelo; treinamento fica no worker.
+2. A API não treina modelo; ingestão e coleta ficam no worker.
 3. Transformações ocorrem em memória (`normalize_window`) sem mutar dados brutos.
