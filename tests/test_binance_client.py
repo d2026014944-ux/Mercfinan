@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from market_predictor.db.binance_client import BinanceClient
+from database.binance_client import BinanceClient
 
 
 class _StubResponse:
