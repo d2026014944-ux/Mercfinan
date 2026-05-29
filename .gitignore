@@ -1,0 +1,5 @@
+# Model artifacts and heavy weights
+/artifacts/
+/models/
+*.pt
+*.h5

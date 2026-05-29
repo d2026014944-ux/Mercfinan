@@ -1,10 +1,14 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+ARG MODEL_FILE=artifacts/model.pt
+ENV MODEL_PATH=/app/models/model.pt
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir poetry && poetry config virtualenvs.create false && poetry install --only main --no-interaction --no-ansi
 COPY apps ./apps
 COPY packages ./packages
+RUN mkdir -p /app/models
+COPY ${MODEL_FILE} /app/models/model.pt
 
 EXPOSE 8000
 CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,313 @@
+name: CI and Deploy to AWS ECS
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: mercfinan-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY_API: ${{ vars.ECR_REPOSITORY_API }}
+  ECR_REPOSITORY_WORKER: ${{ vars.ECR_REPOSITORY_WORKER }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE_API: ${{ vars.ECS_SERVICE_API }}
+  ECS_SERVICE_WORKER: ${{ vars.ECS_SERVICE_WORKER }}
+  ECS_CONTAINER_API: ${{ vars.ECS_CONTAINER_API }}
+  ECS_CONTAINER_WORKER: ${{ vars.ECS_CONTAINER_WORKER }}
+  MODEL_S3_BUCKET: meu-projeto-modelos-prod
+  MODEL_S3_PREFIX: ${{ vars.MODEL_S3_PREFIX }}
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: market_predictor_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d market_predictor_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: poetry
+          cache-dependency-path: poetry.lock
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-ansi
+
+      - name: Lint
+        run: |
+          poetry run python -m pip install --disable-pip-version-check ruff
+          poetry run ruff check .
+
+      - name: Run tests
+        run: poetry run pytest
+
+      - name: Worker -> API cross test (expects 200)
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: "5432"
+          DB_NAME: market_predictor_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+        run: |
+          set -euo pipefail
+
+          poetry run uvicorn apps.api.main:app --host 127.0.0.1 --port 8000 > /tmp/api.log 2>&1 &
+          API_PID=$!
+
+          cleanup() {
+            kill "$API_PID" || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health >/dev/null; then
+              break
+            fi
+            sleep 1
+            if [[ "$attempt" -eq 30 ]]; then
+              echo "API did not become ready in time"
+              cat /tmp/api.log || true
+              exit 1
+            fi
+          done
+
+          REQUEST_BODY=$(poetry run python -c "import json; from apps.data_worker.main import build_feature_window; from model_core.input_schema import MODEL_INPUT_SIZE; closes=[100.0 + idx for idx in range(MODEL_INPUT_SIZE + 2)]; payload=build_feature_window(closes, MODEL_INPUT_SIZE); print(json.dumps({'values': payload}))")
+
+          HTTP_CODE=$(curl -s -o /tmp/predict.json -w "%{http_code}" \
+            -X POST "http://127.0.0.1:8000/predict" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST_BODY")
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "Expected 200 from /predict, got $HTTP_CODE"
+            cat /tmp/predict.json || true
+            cat /tmp/api.log || true
+            exit 1
+          fi
+
+          poetry run python -c "import json; body=json.load(open('/tmp/predict.json', 'r', encoding='utf-8')); assert 'prediction' in body, 'Response body missing prediction field'"
+
+  build_and_push:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name != 'pull_request'
+    outputs:
+      image_api: ${{ steps.export.outputs.image_api }}
+      image_worker: ${{ steps.export.outputs.image_worker }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute immutable image tag
+        id: meta
+        run: echo "tag=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Download latest model from S3
+        id: model
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          if [[ -n "${MODEL_S3_PREFIX}" ]]; then
+            MODEL_KEY=$(aws s3api list-objects-v2 --bucket "$MODEL_S3_BUCKET" --prefix "$MODEL_S3_PREFIX" --query "sort_by(Contents,&LastModified)[-1].Key" --output text)
+          else
+            MODEL_KEY=$(aws s3api list-objects-v2 --bucket "$MODEL_S3_BUCKET" --query "sort_by(Contents,&LastModified)[-1].Key" --output text)
+          fi
+
+          if [[ -z "$MODEL_KEY" || "$MODEL_KEY" == "None" ]]; then
+            echo "No model artifact found in s3://$MODEL_S3_BUCKET/$MODEL_S3_PREFIX"
+            exit 1
+          fi
+
+          aws s3 cp "s3://$MODEL_S3_BUCKET/$MODEL_KEY" "artifacts/model.pt"
+          echo "model_key=$MODEL_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_API }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.mercfinan.model.s3_bucket=${{ env.MODEL_S3_BUCKET }}
+            org.mercfinan.model.s3_key=${{ steps.model.outputs.model_key }}
+          build-args: |
+            MODEL_FILE=artifacts/model.pt
+
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_WORKER }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      - name: Export image URIs
+        id: export
+        run: |
+          echo "image_api=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_API }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "image_worker=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_WORKER }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
+
+  deploy_staging:
+    name: Deploy to ECS Fargate (staging)
+    runs-on: ubuntu-latest
+    needs: [build_and_push]
+    if: github.event_name != 'pull_request'
+    environment: staging
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Update API service task definition
+        env:
+          NEW_IMAGE: ${{ needs.build_and_push.outputs.image_api }}
+        run: |
+          set -euo pipefail
+          SERVICE_DESC=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_API")
+          TASK_DEF_ARN=$(echo "$SERVICE_DESC" | jq -r '.services[0].taskDefinition')
+
+          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query taskDefinition > task-def.json
+
+          jq --arg IMAGE "$NEW_IMAGE" --arg CONTAINER "$ECS_CONTAINER_API" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            | .containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE else . end)
+          ' task-def.json > task-def-updated.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def-updated.json --query taskDefinition.taskDefinitionArn --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE_API" --task-definition "$NEW_TASK_DEF_ARN"
+
+      - name: Update Worker service task definition
+        env:
+          NEW_IMAGE: ${{ needs.build_and_push.outputs.image_worker }}
+        run: |
+          set -euo pipefail
+          SERVICE_DESC=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_WORKER")
+          TASK_DEF_ARN=$(echo "$SERVICE_DESC" | jq -r '.services[0].taskDefinition')
+
+          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query taskDefinition > task-def.json
+
+          jq --arg IMAGE "$NEW_IMAGE" --arg CONTAINER "$ECS_CONTAINER_WORKER" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            | .containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE else . end)
+          ' task-def.json > task-def-updated.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def-updated.json --query taskDefinition.taskDefinitionArn --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE_WORKER" --task-definition "$NEW_TASK_DEF_ARN"
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_API"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_WORKER"
+
+  deploy_production:
+    name: Deploy to ECS Fargate (production)
+    runs-on: ubuntu-latest
+    needs: [deploy_staging, build_and_push]
+    if: github.event_name != 'pull_request'
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Update API service task definition
+        env:
+          NEW_IMAGE: ${{ needs.build_and_push.outputs.image_api }}
+        run: |
+          set -euo pipefail
+          SERVICE_DESC=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_API")
+          TASK_DEF_ARN=$(echo "$SERVICE_DESC" | jq -r '.services[0].taskDefinition')
+
+          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query taskDefinition > task-def.json
+
+          jq --arg IMAGE "$NEW_IMAGE" --arg CONTAINER "$ECS_CONTAINER_API" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            | .containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE else . end)
+          ' task-def.json > task-def-updated.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def-updated.json --query taskDefinition.taskDefinitionArn --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE_API" --task-definition "$NEW_TASK_DEF_ARN"
+
+      - name: Update Worker service task definition
+        env:
+          NEW_IMAGE: ${{ needs.build_and_push.outputs.image_worker }}
+        run: |
+          set -euo pipefail
+          SERVICE_DESC=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_WORKER")
+          TASK_DEF_ARN=$(echo "$SERVICE_DESC" | jq -r '.services[0].taskDefinition')
+
+          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query taskDefinition > task-def.json
+
+          jq --arg IMAGE "$NEW_IMAGE" --arg CONTAINER "$ECS_CONTAINER_WORKER" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            | .containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE else . end)
+          ' task-def.json > task-def-updated.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def-updated.json --query taskDefinition.taskDefinitionArn --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE_WORKER" --task-definition "$NEW_TASK_DEF_ARN"
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_API"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE_WORKER"
